@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-WoW Addon Updater
-=================
+WoW Addon Updater (GitHub edition)
+==================================
 A small, portable Windows tool that scans a World of Warcraft AddOns folder,
-looks every addon up on CurseForge, shows installed vs. available version and
-lets you update each addon with one click.
+finds the GitHub repository each addon is released from, shows installed vs.
+latest released version and lets you update each addon with one click.
 
 Standard library only (tkinter + urllib) so it packages into a small
 single-file .exe with PyInstaller.
 
-CurseForge access goes through the official CurseForge API, which needs an
-API key (apply via the form linked from API_KEY_URL below). The key is asked
-for on first run and stored in WoWAddonUpdater.json next to the program.
+No account or key is needed: it reads the public GitHub Releases API. An
+optional personal access token only raises GitHub's hourly request allowance.
 """
 
 from __future__ import annotations
@@ -35,45 +34,51 @@ import webbrowser
 import zipfile
 from dataclasses import dataclass, field
 
-APP_NAME = "WoW Addon Updater"
-APP_VERSION = "1.0.0"
-CONFIG_NAME = "WoWAddonUpdater.json"
+APP_NAME = "WoW Addon Updater (GitHub)"
+APP_VERSION = "1.1.0"
+CONFIG_NAME = "WoWAddonUpdater-GitHub.json"
 
 DEFAULT_ADDONS_PATH = r"D:\World of Warcraft\_forever_\Interface\AddOns"
-API_BASE = "https://api.curseforge.com"
-API_KEY_URL = "https://support.curseforge.com/support/solutions/articles/9000208346"
-WOW_GAME_ID = 1
+API_BASE = "https://api.github.com"
+TOKEN_URL = "https://github.com/settings/tokens"
 
-# CurseForge "game version type" (flavour) ids. The live list is read from the
-# API at runtime; these are only the fallback when that call fails.
-FALLBACK_FLAVORS = [
-    (88568, "WoW Forever"),
-    (517, "WoW Retail"),
-    (67408, "WoW Classic Era"),
+# Game flavours: key, label, names used in a release.json manifest, words used in zip file names.
+FLAVORS = [
+    ("forever", "WoW Forever", ("forever",), ("forever", "camelot")),
+    ("mainline", "Retail", ("mainline", "retail"), ("mainline", "retail")),
+    ("vanilla", "Classic Era", ("classic", "vanilla"), ("vanilla", "classic", "era")),
+    ("tbc", "TBC Classic", ("bcc", "tbc"), ("bcc", "tbc")),
+    ("wrath", "Wrath Classic", ("wrath",), ("wrath", "wotlk")),
+    ("cata", "Cataclysm Classic", ("cata",), ("cata", "cataclysm")),
+    ("mists", "MoP Classic", ("mists",), ("mists", "mop")),
 ]
-# install sub-folder -> (keyword to find in the API flavour name, fallback id)
-FOLDER_FLAVOR_HINTS = {
-    "_forever_": ("forever", 88568),
-    "_retail_": ("retail", 517),
-    "_classic_era_": ("", 67408),
-}
+# install sub-folder -> flavour key
+FOLDER_FLAVORS = {"_forever_": "forever", "_retail_": "mainline", "_classic_era_": "vanilla"}
+# TOC interface numbers that identify a flavour when a manifest gives no flavour name
+INTERFACE_RANGES = {"forever": (16000, 16999)}
 
-RELEASE, BETA, ALPHA = 1, 2, 3
-CHANNEL_LABELS = {RELEASE: "Release only", BETA: "Release + Beta", ALPHA: "Release + Beta + Alpha"}
+# Addons whose TOC does not name their repository. Folder name (lower case) -> owner/repo.
+# Each entry comes from the author's own project page; change or remove a link with right-click.
+KNOWN_REPOS = {
+    "questie": "Questie/Questie",
+    "questiedb": "Questie/QuestieDB",
+    "tomtom": "jnwhiteh/TomTom",
+    "openmap": "openmap-world/openmap",
+}
 
 # Entry status values
 ST_OK = "Up to date"
 ST_UPDATE = "Update available"
 ST_DIFF = "Different version"
-ST_NEWER = "Newer than CurseForge"
+ST_NEWER = "Newer than latest release"
 ST_UNLINKED = "Not linked"
 ST_NOFILE = "No file for this game version"
-ST_MISSING = "Not found on CurseForge"
+ST_NOREL = "No releases on GitHub"
+ST_MISSING = "Repository not found"
 ST_QUEUED = "Queued…"
 ST_UPDATING = "Updating…"
 ST_UPDATED = "Updated"
 ST_ERROR = "Error"
-ST_MANUAL = "Manual download only"
 
 
 # --------------------------------------------------------------------------
@@ -106,14 +111,14 @@ def config_path() -> str:
 class Config:
     DEFAULTS = {
         "addons_path": DEFAULT_ADDONS_PATH,
-        "api_key": "",
+        "token": "",             # optional GitHub personal access token
         "api_base": API_BASE,
-        "flavor_id": 0,          # 0 = detect from the folder name
-        "channel": RELEASE,
+        "flavor": "",            # "" = detect from the folder name
+        "prerelease": False,
         "backup": True,
         "only_updates": False,
         "geometry": "",
-        "profiles": {},          # per AddOns folder: links / nomatch / installed
+        "profiles": {},          # per AddOns folder: links / installed
     }
 
     def __init__(self, path: str | None = None):
@@ -149,9 +154,8 @@ class Config:
     def profile(self) -> dict:
         key = os.path.normcase(os.path.normpath(self.data["addons_path"]))
         prof = self.data["profiles"].setdefault(key, {})
-        prof.setdefault("links", {})       # folder -> CurseForge project id
-        prof.setdefault("nomatch", {})     # folder -> date of last failed lookup
-        prof.setdefault("installed", {})   # project id -> install record
+        prof.setdefault("links", {})       # folder -> owner/repo ("" = deliberately unlinked)
+        prof.setdefault("installed", {})   # owner/repo (lower case) -> install record
         return prof
 
 
@@ -171,7 +175,7 @@ class LocalAddon:
     title: str = ""
     version: str = ""
     interface: str = ""
-    project_id: int | None = None
+    repo: str = ""              # owner/repo named in the TOC, if any
     deps: list = field(default_factory=list)
 
 
@@ -206,11 +210,46 @@ def find_toc(folder_path: str, folder: str) -> str | None:
     # Flavour specific TOCs: Addon_Mainline.toc, Addon-Classic.toc, ...
     prefixed = sorted(f for f in tocs
                       if re.match(re.escape(folder) + r"[-_]", f, re.I))
-    for hint in ("forever", "mainline", "vanilla", "classic"):
+    for hint in ("forever", "camelot", "mainline", "vanilla", "classic"):
         for f in prefixed:
             if hint in f.lower():
                 return os.path.join(folder_path, f)
     return os.path.join(folder_path, (prefixed or sorted(tocs))[0])
+
+
+_REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}$")
+_GH_URL = re.compile(r"github\.com[/:]+([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)", re.I)
+_NOT_OWNERS = {"sponsors", "orgs", "users", "settings", "marketplace", "features", "topics",
+               "about", "login", "apps", "collections"}
+
+
+def parse_repo(text: str) -> str:
+    """'https://github.com/Owner/Name/releases' or 'Owner/Name' -> 'Owner/Name'; '' if neither."""
+    text = (text or "").strip()
+    m = _GH_URL.search(text)
+    if m:
+        owner, name = m.group(1), m.group(2)
+    elif _REPO.match(text):
+        owner, name = text.split("/", 1)
+    else:
+        return ""
+    name = name.rstrip(".")
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+    repo = "%s/%s" % (owner, name)
+    return repo if name and owner.lower() not in _NOT_OWNERS and _REPO.match(repo) else ""
+
+
+def toc_repo(fields: dict) -> str:
+    """GitHub repository named anywhere in an addon's TOC metadata (X-Website, X-Github, ...)."""
+    preferred = ("x-github", "x-repository", "x-repo", "x-source", "x-website", "x-url", "x-homepage")
+    for key in list(preferred) + [k for k in fields if k not in preferred]:
+        value = fields.get(key) or ""
+        if "github.com" in value.lower():
+            repo = parse_repo(value) if _GH_URL.search(value) else ""
+            if repo:
+                return repo
+    return ""
 
 
 def scan_addons(addons_path: str) -> list:
@@ -227,17 +266,13 @@ def scan_addons(addons_path: str) -> list:
         version = (f.get("version") or "").strip()
         if _PLACEHOLDER.search(version):
             version = ""  # unpackaged development checkout
-        pid = None
-        raw = (f.get("x-curse-project-id") or "").strip()
-        if raw.isdigit() and int(raw) > 0:
-            pid = int(raw)
         deps = f.get("requireddeps") or f.get("dependencies") or f.get("requireddep") or ""
         result.append(LocalAddon(
             folder=name,
             title=clean_title(f.get("title", "")) or name,
             version=version,
             interface=(f.get("interface") or "").strip(),
-            project_id=pid,
+            repo=toc_repo(f),
             deps=[d.strip() for d in deps.split(",") if d.strip()],
         ))
     return result
@@ -280,125 +315,129 @@ def compare_versions(installed: str, latest_name: str, latest_file: str = "") ->
 
 
 # --------------------------------------------------------------------------
-# CurseForge API client
+# GitHub Releases client
 # --------------------------------------------------------------------------
 
-class CurseForgeError(Exception):
+class GitHubError(Exception):
     pass
 
 
-def _key_allowed_host(host: str) -> bool:
-    host = (host or "").lower()
-    return host.endswith(".forgecdn.net") or host.endswith(".curseforge.com") \
-        or host in ("forgecdn.net", "curseforge.com")
+class RepoNotFound(GitHubError):
+    pass
 
 
-class _SafeRedirect(urllib.request.HTTPRedirectHandler):
-    """Follow redirects, but never forward the API key to a foreign host."""
+class RateLimited(GitHubError):
+    pass
+
+
+class _DropAuthOnRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never forward the access token to another host."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and not _key_allowed_host(urllib.parse.urlsplit(newurl).hostname or ""):
-            for store in (new.headers, new.unredirected_hdrs):
-                for name in [k for k in store if k.lower() == "x-api-key"]:
-                    del store[name]
+        if new is not None:
+            old_host = urllib.parse.urlsplit(req.full_url).hostname
+            if urllib.parse.urlsplit(newurl).hostname != old_host:
+                for store in (new.headers, new.unredirected_hdrs):
+                    for name in [k for k in store if k.lower() == "authorization"]:
+                        del store[name]
         return new
 
 
-class CurseForge:
-    def __init__(self, api_key: str, base: str = API_BASE, timeout: int = 30):
-        self.api_key = (api_key or "").strip()
+class GitHub:
+    def __init__(self, token: str = "", base: str = API_BASE, timeout: int = 30):
+        self.token = (token or "").strip()
         self.base = (base or API_BASE).rstrip("/")
         self.timeout = timeout
-        self.opener = urllib.request.build_opener(_SafeRedirect())
-        self._base_host = urllib.parse.urlsplit(self.base).hostname or ""
+        self.opener = urllib.request.build_opener(_DropAuthOnRedirect())
+        self._base = urllib.parse.urlsplit(self.base)
+        self.remaining: int | None = None   # API requests left this hour, as reported by GitHub
+        self._manifests: dict = {}
 
     # -- low level --------------------------------------------------------
-    def _headers(self, url: str) -> dict:
-        headers = {"Accept": "application/json",
-                   "User-Agent": f"WoWAddonUpdater/{APP_VERSION} (personal use)"}
-        host = urllib.parse.urlsplit(url).hostname or ""
-        if self.api_key and (host == self._base_host or _key_allowed_host(host)):
-            headers["x-api-key"] = self.api_key
-        return headers
+    def _open(self, url: str, api: bool):
+        headers = {"User-Agent": "WoWAddonUpdater/%s" % APP_VERSION}
+        if api:
+            headers["Accept"] = "application/vnd.github+json"
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+            if self.token:
+                headers["Authorization"] = "Bearer " + self.token
+        return self.opener.open(urllib.request.Request(url, headers=headers), timeout=self.timeout)
 
-    def _request(self, method: str, path: str, params: dict | None = None, body=None):
-        url = self.base + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        data = None
-        headers = self._headers(url)
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            headers["Content-Type"] = "application/json"
+    def _note_limit(self, headers) -> None:
+        try:
+            self.remaining = int(headers.get("x-ratelimit-remaining"))
+        except (TypeError, ValueError, AttributeError):
+            pass
+
+    @staticmethod
+    def _limit_message(headers) -> str:
+        when = ""
+        try:
+            reset = _dt.datetime.fromtimestamp(int(headers.get("x-ratelimit-reset")))
+            when = " It resets at %s." % reset.strftime("%H:%M")
+        except (TypeError, ValueError, OSError, OverflowError):
+            pass
+        return ("GitHub's request allowance for this hour is used up.%s An optional access token "
+                "(Settings) raises the allowance from 60 to 5,000 requests per hour." % when)
+
+    def _api(self, path: str, params: dict | None = None):
+        url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
         last = None
         for attempt in range(3):
-            req = urllib.request.Request(url, data=data, headers=headers, method=method)
             try:
-                with self.opener.open(req, timeout=self.timeout) as resp:
+                with self._open(url, api=True) as resp:
+                    self._note_limit(resp.headers)
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
-                if exc.code in (401, 403):
-                    raise CurseForgeError(
-                        "CurseForge rejected the API key (HTTP %d). "
-                        "Check the key under Settings." % exc.code) from None
-                if exc.code == 404:
-                    raise CurseForgeError("Not found on CurseForge (HTTP 404).") from None
-                last = "CurseForge returned HTTP %d." % exc.code
-                if exc.code not in (429, 500, 502, 503, 504):
+                self._note_limit(exc.headers)
+                limited = exc.headers.get("x-ratelimit-remaining") == "0" or exc.headers.get("retry-after")
+                if exc.code in (403, 429) and limited:
+                    raise RateLimited(self._limit_message(exc.headers)) from None
+                if exc.code == 401:
+                    raise GitHubError("GitHub rejected the access token (HTTP 401). "
+                                      "Correct or clear it under Settings.") from None
+                if exc.code in (404, 410, 451):
+                    raise RepoNotFound("GitHub has no public repository at this address.") from None
+                last = "GitHub returned HTTP %d." % exc.code
+                if exc.code not in (500, 502, 503, 504):
                     break
             except (urllib.error.URLError, OSError, ValueError) as exc:
-                last = "Could not reach CurseForge: %s" % getattr(exc, "reason", exc)
+                last = "Could not reach GitHub: %s" % getattr(exc, "reason", exc)
             time.sleep(1.5 * (attempt + 1))
-        raise CurseForgeError(last or "CurseForge request failed.")
+        raise GitHubError(last or "GitHub request failed.")
+
+    def _trusted(self, url: str) -> bool:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme == "https" and parts.hostname == "github.com":
+            return True
+        return parts.scheme == self._base.scheme and parts.netloc == self._base.netloc  # test server
 
     # -- endpoints --------------------------------------------------------
-    def version_types(self) -> list:
-        data = self._request("GET", f"/v1/games/{WOW_GAME_ID}/version-types").get("data") or []
-        return [(int(t["id"]), t.get("name") or t.get("slug") or str(t["id"])) for t in data]
+    def releases(self, repo: str) -> list:
+        data = self._api("/repos/%s/releases" % repo, {"per_page": 15})
+        return data if isinstance(data, list) else []
 
-    def mods(self, ids: list) -> dict:
-        found = {}
-        ids = sorted(set(int(i) for i in ids))
-        for start in range(0, len(ids), 50):
-            chunk = ids[start:start + 50]
-            data = self._request("POST", "/v1/mods", body={"modIds": chunk, "filterPcOnly": True})
-            for mod in data.get("data") or []:
-                found[int(mod["id"])] = mod
-        return found
-
-    def search_slug(self, slug: str) -> dict | None:
-        data = self._request("GET", "/v1/mods/search",
-                             params={"gameId": WOW_GAME_ID, "slug": slug, "pageSize": 5})
-        for mod in data.get("data") or []:
-            if mod.get("gameId") == WOW_GAME_ID and (mod.get("slug") or "").lower() == slug.lower():
-                return mod
-        return None
-
-    def files(self, file_ids: list) -> dict:
-        found = {}
-        ids = sorted(set(int(i) for i in file_ids))
-        for start in range(0, len(ids), 50):
-            data = self._request("POST", "/v1/mods/files", body={"fileIds": ids[start:start + 50]})
-            for f in data.get("data") or []:
-                found[int(f["id"])] = f
-        return found
-
-    def mod_files(self, mod_id: int, flavor_id: int) -> list:
-        data = self._request("GET", f"/v1/mods/{mod_id}/files",
-                             params={"gameVersionTypeId": flavor_id, "pageSize": 30})
-        return data.get("data") or []
-
-    def download_url(self, mod_id: int, file_id: int) -> str:
-        data = self._request("GET", f"/v1/mods/{mod_id}/files/{file_id}/download-url")
-        return data.get("data") or ""
+    def manifest(self, url: str) -> dict | None:
+        """Fetch a release.json asset (small file written by the BigWigs packager)."""
+        if url in self._manifests:
+            return self._manifests[url]
+        result = None
+        if self._trusted(url):
+            try:
+                with self._open(url, api=False) as resp:
+                    parsed = json.loads(resp.read(2 << 20).decode("utf-8"))
+                    result = parsed if isinstance(parsed, dict) else None
+            except (urllib.error.URLError, OSError, ValueError):
+                result = None
+        self._manifests[url] = result
+        return result
 
     def download(self, url: str, dest: str, progress=None) -> None:
-        if urllib.parse.urlsplit(url).scheme not in ("https", "http"):
-            raise CurseForgeError("Unexpected download address.")
-        req = urllib.request.Request(url, headers=self._headers(url))
+        if not self._trusted(url):
+            raise GitHubError("Unexpected download address: %s" % url)
         try:
-            with self.opener.open(req, timeout=self.timeout) as resp, open(dest, "wb") as out:
+            with self._open(url, api=False) as resp, open(dest, "wb") as out:
                 total = int(resp.headers.get("Content-Length") or 0)
                 done = 0
                 while True:
@@ -410,13 +449,13 @@ class CurseForge:
                     if progress:
                         progress(done, total)
         except urllib.error.HTTPError as exc:
-            raise CurseForgeError("Download failed (HTTP %d)." % exc.code) from None
+            raise GitHubError("Download failed (HTTP %d)." % exc.code) from None
         except (urllib.error.URLError, OSError) as exc:
-            raise CurseForgeError("Download failed: %s" % getattr(exc, "reason", exc)) from None
+            raise GitHubError("Download failed: %s" % getattr(exc, "reason", exc)) from None
 
 
 # --------------------------------------------------------------------------
-# Matching installed addons to CurseForge projects and checking versions
+# Matching installed addons to GitHub repositories and checking versions
 # --------------------------------------------------------------------------
 
 @dataclass
@@ -425,11 +464,11 @@ class Entry:
     name: str
     folders: list
     installed: str = ""
-    project_id: int | None = None
-    matched_by: str = ""        # toc / linked / installed / name
+    repo: str = ""              # owner/repo
+    matched_by: str = ""        # toc / linked / built-in list / installed / module
     url: str = ""
     available: str = ""
-    latest: dict | None = None  # CurseForge file object
+    latest: dict | None = None  # {"release": ..., "asset": ..., "how": ...}
     status: str = ST_UNLINKED
     detail: str = ""
     primary: str = ""           # folder whose TOC supplies the version
@@ -439,43 +478,17 @@ class Entry:
         return self.latest is not None and self.status in (ST_UPDATE, ST_DIFF, ST_ERROR)
 
 
-def detect_flavor(addons_path: str, flavors: list) -> int:
-    """Pick the CurseForge flavour id from the install sub-folder (_forever_, ...)."""
+def detect_flavor(addons_path: str) -> str:
+    """Pick the game flavour from the install sub-folder (_forever_, _retail_, ...)."""
     parts = [p.lower() for p in re.split(r"[\\/]+", addons_path or "")]
-    for folder, (keyword, fallback) in FOLDER_FLAVOR_HINTS.items():
+    for folder, key in FOLDER_FLAVORS.items():
         if folder in parts:
-            if keyword:
-                for fid, name in flavors:
-                    if keyword in name.lower():
-                        return fid
-            return fallback
-    return 0
+            return key
+    return ""
 
 
-def slug_candidates(folder: str, title: str) -> list:
-    out = []
-    for text in (folder, title):
-        text = re.sub(r"[!']", "", text or "")
-        spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", text)
-        for variant in (text, spaced):
-            dashed = re.sub(r"[^a-z0-9]+", "-", variant.lower()).strip("-")
-            for slug in (dashed, dashed.replace("-", "")):
-                if len(slug) >= 3 and slug not in out:
-                    out.append(slug)
-    return out[:4]
-
-
-def parse_link(text: str):
-    """'12345' -> ('id', 12345); a curseforge.com/wow/addons/<slug> URL -> ('slug', slug)."""
-    text = (text or "").strip()
-    if text.isdigit():
-        return "id", int(text)
-    m = re.search(r"curseforge\.com/wow/addons/([A-Za-z0-9_-]+)", text)
-    if m:
-        return "slug", m.group(1).lower()
-    if re.fullmatch(r"[A-Za-z0-9_-]{3,}", text):
-        return "slug", text.lower()
-    return None, None
+def flavor_label(key: str) -> str:
+    return next((label for k, label, _m, _w in FLAVORS if k == key), key)
 
 
 def _related(folder: str, dep: str) -> bool:
@@ -487,26 +500,29 @@ def _related(folder: str, dep: str) -> bool:
     return f.startswith(d) or (len(head(f)) >= 3 and head(f) == head(d))
 
 
-def build_entries(addons: list, profile: dict, client: CurseForge | None, progress=None) -> list:
-    """Group addon folders by CurseForge project. Unmatched folders get their own entry."""
+def build_entries(addons: list, profile: dict) -> list:
+    """Group addon folders by GitHub repository. Unmatched folders get their own entry."""
     by_folder = {a.folder: a for a in addons}
-    assigned: dict = {}   # folder -> (project id, how)
+    assigned: dict = {}   # folder -> (owner/repo, how)
+    blocked = {f for f, link in profile["links"].items() if link == ""}  # unlinked by the user
 
-    blocked = {f for f, link in profile["links"].items() if link == 0}  # unlinked by the user
     for a in addons:
-        link = profile["links"].get(a.folder)
         if a.folder in blocked:
             continue
-        if isinstance(link, int) and link > 0:
+        link = parse_repo(profile["links"].get(a.folder) or "")
+        known = KNOWN_REPOS.get(a.folder.lower())
+        if link:
             assigned[a.folder] = (link, "linked")
-        elif a.project_id:
-            assigned[a.folder] = (a.project_id, "toc")
-    for pid, rec in profile["installed"].items():
+        elif a.repo:
+            assigned[a.folder] = (a.repo, "toc")
+        elif known:
+            assigned[a.folder] = (known, "built-in list")
+    for rec in profile["installed"].values():
         for folder in rec.get("folders", []):
-            if folder in by_folder and folder not in assigned and folder not in blocked:
-                assigned[folder] = (int(pid), "installed")
+            if folder in by_folder and folder not in assigned and folder not in blocked and rec.get("repo"):
+                assigned[folder] = (rec["repo"], "installed")
 
-    # Modules without their own id inherit the project of the addon they extend.
+    # Modules without their own link inherit the repository of the addon they extend.
     for _ in range(3):
         for a in addons:
             if a.folder in assigned or a.folder in blocked:
@@ -516,133 +532,161 @@ def build_entries(addons: list, profile: dict, client: CurseForge | None, progre
                     assigned[a.folder] = (assigned[dep][0], "module")
                     break
 
-    # Last resort: look the folder name up on CurseForge (cached for a week when it fails).
-    today = _dt.date.today()
-    todo = []
-    for a in addons:
-        if a.folder in assigned or a.folder in blocked:
-            continue
-        stamp = profile["nomatch"].get(a.folder)
-        try:
-            fresh = stamp and (today - _dt.date.fromisoformat(stamp)).days < 7
-        except ValueError:
-            fresh = False
-        if not fresh:
-            todo.append(a)
-    if client:
-        for n, a in enumerate(todo, 1):
-            if progress:
-                progress("Looking up %s on CurseForge… (%d/%d)" % (a.folder, n, len(todo)))
-            mod = None
-            for slug in slug_candidates(a.folder, a.title):
-                mod = client.search_slug(slug)
-                if mod:
-                    break
-            if mod:
-                assigned[a.folder] = (int(mod["id"]), "name")
-                profile["nomatch"].pop(a.folder, None)
-            else:
-                profile["nomatch"][a.folder] = today.isoformat()
-        # a second module pass now that more parents are known
-        for a in addons:
-            if a.folder not in assigned and a.folder not in blocked:
-                for dep in a.deps:
-                    if dep in assigned and _related(a.folder, dep):
-                        assigned[a.folder] = (assigned[dep][0], "module")
-                        break
-
     groups: dict = {}
     for a in addons:
-        pid, how = assigned.get(a.folder, (None, ""))
-        groups.setdefault("p%d" % pid if pid else "f:" + a.folder, []).append((a, how, pid))
+        repo, how = assigned.get(a.folder, ("", ""))
+        groups.setdefault("r:" + repo.lower() if repo else "f:" + a.folder, []).append((a, how, repo))
     entries = []
     for key, members in groups.items():
-        folders = {a.folder for a, _how, _pid in members}
-        needed = {d for a, _how, _pid in members for d in a.deps if d in folders}
+        folders = {a.folder for a, _how, _repo in members}
+        needed = {d for a, _how, _repo in members for d in a.deps if d in folders}
         # main folder: not a module, preferably the one the others depend on, then the shortest name
-        main, how, pid = min(members, key=lambda m: (m[1] == "module", m[0].folder not in needed,
-                                                     len(m[0].folder), m[0].folder.lower()))
-        version = main.version or next((a.version for a, _h, _p in members if a.version), "")
+        main, how, repo = min(members, key=lambda m: (m[1] == "module", m[0].folder not in needed,
+                                                      len(m[0].folder), m[0].folder.lower()))
+        version = main.version or next((a.version for a, _h, _r in members if a.version), "")
         entries.append(Entry(key=key, name=main.title, folders=sorted(folders, key=str.lower),
-                             installed=version, project_id=pid, matched_by=how, primary=main.folder))
+                             installed=version, repo=repo, matched_by=how, primary=main.folder))
     return entries
 
 
-def pick_latest_index(mod: dict, flavor_id: int, channel: int) -> dict | None:
-    cands = [i for i in (mod.get("latestFilesIndexes") or [])
-             if i.get("gameVersionTypeId") == flavor_id and (i.get("releaseType") or RELEASE) <= channel]
-    return max(cands, key=lambda i: i.get("fileId", 0)) if cands else None
+# -- choosing the right file of a release ------------------------------------
+
+def _alnum(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
 
 
-def file_label(f: dict) -> str:
-    label = (f.get("displayName") or f.get("fileName") or "").strip()
-    return label[:-4] if label.lower().endswith(".zip") else label
+def asset_flavors(name: str, folder: str = "") -> set:
+    """Game flavours named in a zip file name (the addon's own name is ignored)."""
+    low = name.lower()
+    if folder and low.startswith(folder.lower()):
+        low = low[len(folder):]
+    return {key for key, _label, _meta, words in FLAVORS
+            if any(re.search(r"(?<![a-z])" + re.escape(w) + r"(?![a-z])", low) for w in words)}
+
+
+def pick_asset(release: dict, flavor: str, folder: str, client: GitHub | None, named: bool = False):
+    """Return (asset, how) for the zip of `release` that fits the game flavour, or None.
+
+    With named=True only zips whose file name starts with the addon's folder name count,
+    which keeps repositories that publish several addons apart.
+    """
+    assets = release.get("assets") or []
+    zips = [a for a in assets if (a.get("name") or "").lower().endswith(".zip")
+            and a.get("state", "uploaded") == "uploaded"
+            and (not named or _alnum(a["name"]).startswith(_alnum(folder)))]
+    if not zips:
+        return None
+    by_name = {a["name"]: a for a in zips}
+    meta_names = next((set(meta) for key, _l, meta, _w in FLAVORS if key == flavor), set())
+    lo, hi = INTERFACE_RANGES.get(flavor, (1, 0))
+    rank = lambda name: (not _alnum(name).startswith(_alnum(folder)), "nolib" in name.lower(), len(name))
+
+    # 1. release.json, where the author states which file is for which game version
+    listed = set()
+    manifest_asset = next((a for a in assets if (a.get("name") or "").lower() == "release.json"), None)
+    if manifest_asset and client:
+        manifest = client.manifest(manifest_asset.get("browser_download_url") or "") or {}
+        rows = []
+        for item in manifest.get("releases") or []:
+            fname = item.get("filename")
+            if fname not in by_name:
+                continue
+            listed.add(fname)
+            if item.get("nolib"):
+                continue
+            meta = [m for m in (item.get("metadata") or []) if isinstance(m, dict)]
+            names = {str(m.get("flavor") or "").lower() for m in meta}
+            fits = bool(names & meta_names) or any(
+                isinstance(m.get("interface"), int) and lo <= m["interface"] <= hi for m in meta)
+            if fits:
+                rows.append((len(names), rank(fname), fname))
+        if rows:
+            return by_name[min(rows)[2]], "release.json"
+
+    # 2. a file whose name says it is for this game version
+    specific = [a for a in zips if flavor in asset_flavors(a["name"], folder)]
+    if specific:
+        return min(specific, key=lambda a: rank(a["name"])), "file name"
+
+    # 3. a file that names no game version at all (one zip for every version)
+    generic = [a for a in zips if a["name"] not in listed and not asset_flavors(a["name"], folder)
+               and "nolib" not in a["name"].lower()]
+    if generic:
+        return min(generic, key=lambda a: rank(a["name"])), "single file"
+    return None
+
+
+def pick_release(releases: list, flavor: str, folder: str, allow_pre: bool, client: GitHub | None):
+    """Newest published release that has a file for the game flavour: (release, asset, how) or None."""
+    usable = [r for r in releases if isinstance(r, dict) and not r.get("draft")
+              and (allow_pre or not r.get("prerelease"))]
+    usable.sort(key=lambda r: r.get("published_at") or r.get("created_at") or "", reverse=True)
+    for named in (True, False):     # first by file name, then any zip in the release
+        for release in usable[:8]:
+            found = pick_asset(release, flavor, folder, client, named)
+            if found:
+                return release, found[0], found[1]
+    return None
 
 
 def evaluate(entry: Entry, profile: dict) -> None:
     """Set entry.status by comparing the installed version with entry.latest."""
-    f = entry.latest
-    entry.available = file_label(f)
-    rec = profile["installed"].get(str(entry.project_id))
-    if rec and rec.get("toc_version", None) == entry.installed and rec.get("file_id"):
-        # Installed through this tool and untouched since: compare exact file ids.
-        if int(rec["file_id"]) == int(f["id"]):
+    release, asset = entry.latest["release"], entry.latest["asset"]
+    entry.available = release.get("tag_name") or release.get("name") or asset.get("name", "")
+    entry.url = release.get("html_url") or "https://github.com/%s/releases" % entry.repo
+    rec = profile["installed"].get(entry.repo.lower())
+    if rec and rec.get("toc_version", None) == entry.installed and rec.get("asset_id"):
+        # Installed through this tool and untouched since: compare the exact release file.
+        if rec["asset_id"] == asset.get("id"):
             entry.status = ST_OK
-        elif int(rec["file_id"]) < int(f["id"]):
+        elif (release.get("published_at") or "") >= (rec.get("published_at") or ""):
             entry.status = ST_UPDATE
         else:
             entry.status = ST_NEWER
         return
-    result = compare_versions(entry.installed, f.get("displayName", ""), f.get("fileName", ""))
+    result = compare_versions(entry.installed, release.get("tag_name", ""), asset.get("name", ""))
+    if result == "unknown" and release.get("name"):
+        result = compare_versions(entry.installed, release["name"])
     entry.status = {"same": ST_OK, "older": ST_UPDATE, "newer": ST_NEWER}.get(result, ST_DIFF)
     if entry.status == ST_DIFF:
-        entry.detail = ("The installed version text does not match CurseForge's latest file, "
-                        "so it may be out of date. Updating installs the latest file.")
+        entry.detail = ("The installed version text does not match the latest release, so it may be "
+                        "out of date. Updating installs the latest release.")
 
 
-def check_entries(entries: list, profile: dict, client: CurseForge, flavor_id: int,
-                  channel: int, progress=None) -> None:
-    linked = [e for e in entries if e.project_id]
-    if progress:
-        progress("Checking %d addons on CurseForge…" % len(linked))
-    mods = client.mods([e.project_id for e in linked])
-    wanted: dict = {}
-    for e in linked:
-        mod = mods.get(e.project_id)
-        if not mod:
-            e.status, e.detail = ST_MISSING, "CurseForge has no project with id %d." % e.project_id
+def check_entries(entries: list, profile: dict, client: GitHub, flavor: str,
+                  allow_pre: bool, progress=None) -> None:
+    linked = [e for e in entries if e.repo]
+    limited = ""
+    for n, e in enumerate(linked, 1):
+        e.url = "https://github.com/%s/releases" % e.repo
+        if limited:
+            e.status, e.detail = ST_ERROR, limited
             continue
-        e.url = ((mod.get("links") or {}).get("websiteUrl")
-                 or "https://www.curseforge.com/wow/addons/%s" % mod.get("slug", ""))
-        idx = pick_latest_index(mod, flavor_id, channel)
-        if idx:
-            cached = next((f for f in (mod.get("latestFiles") or []) if f.get("id") == idx["fileId"]), None)
-            if cached:
-                e.latest = cached
-            else:
-                wanted[int(idx["fileId"])] = e
-        else:
-            # The index can lag behind for a new game version: ask for the file list directly.
-            try:
-                files = [f for f in client.mod_files(e.project_id, flavor_id)
-                         if (f.get("releaseType") or RELEASE) <= channel]
-            except CurseForgeError:
-                files = []
-            if files:
-                e.latest = max(files, key=lambda f: f.get("id", 0))
-            else:
-                e.status = ST_NOFILE
-                e.detail = "This project has no file for the selected game version / release channel."
-    if wanted:
-        details = client.files(list(wanted))
-        for fid, e in wanted.items():
-            if fid in details:
-                e.latest = details[fid]
-            else:
-                e.status, e.detail = ST_ERROR, "CurseForge did not return details for file %d." % fid
-    for e in linked:
-        if e.latest is not None:
-            evaluate(e, profile)
+        if progress:
+            progress("Checking %s on GitHub… (%d/%d)" % (e.name, n, len(linked)))
+        try:
+            releases = client.releases(e.repo)
+        except RepoNotFound as exc:
+            e.status, e.detail = ST_MISSING, "%s (%s)" % (exc, e.repo)
+            continue
+        except RateLimited as exc:
+            limited = str(exc)
+            e.status, e.detail = ST_ERROR, limited
+            continue
+        if not releases:
+            e.status = ST_NOREL
+            e.detail = "%s has not published any releases, so there is nothing to compare with." % e.repo
+            continue
+        found = pick_release(releases, flavor, e.primary, allow_pre, client)
+        if not found:
+            e.status = ST_NOFILE
+            e.detail = ("None of the recent releases of %s has a zip file for %s."
+                        % (e.repo, flavor_label(flavor)))
+            continue
+        e.latest = {"release": found[0], "asset": found[1], "how": found[2]}
+        evaluate(e, profile)
+    if limited:
+        raise RateLimited(limited)
 
 
 # --------------------------------------------------------------------------
@@ -651,10 +695,6 @@ def check_entries(entries: list, profile: dict, client: CurseForge, flavor_id: i
 
 class UpdateError(Exception):
     pass
-
-
-class ManualDownload(UpdateError):
-    """The author has switched off downloads through the API."""
 
 
 _BAD_NAME = re.compile(r'[<>:"|?*\x00-\x1f]')
@@ -688,7 +728,7 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, onerror=onerror)
 
 
-def install_zip(zip_path: str, addons_path: str, backup: bool = True) -> list:
+def install_zip(zip_path: str, addons_path: str, backup: bool = True, expect: set | None = None) -> list:
     """Replace the addon folders contained in zip_path. Returns the folder names installed.
 
     The old folders are moved aside first and put back if anything fails, so an
@@ -701,6 +741,9 @@ def install_zip(zip_path: str, addons_path: str, backup: bool = True) -> list:
     try:
         with zipfile.ZipFile(zip_path) as zf:
             tops = _zip_plan(zf)
+            if expect and not ({t.lower() for t in tops} & {f.lower() for f in expect}):
+                raise UpdateError("The release file does not contain this addon (it holds: %s). "
+                                  "Check the repository link." % ", ".join(tops))
             os.makedirs(staging)
             root = os.path.realpath(staging)
             for info in zf.infolist():
@@ -751,44 +794,38 @@ def install_zip(zip_path: str, addons_path: str, backup: bool = True) -> list:
     return tops
 
 
-def update_entry(entry: Entry, cfg: Config, client: CurseForge, progress=None) -> None:
-    """Download and install entry.latest, then record what was installed."""
-    f = entry.latest
-    if not f:
+def update_entry(entry: Entry, cfg: Config, client: GitHub, progress=None) -> None:
+    """Download and install the release file in entry.latest, then record what was installed."""
+    if not entry.latest:
         raise UpdateError("Nothing to install.")
-    url = f.get("downloadUrl") or ""
+    release, asset = entry.latest["release"], entry.latest["asset"]
+    url = asset.get("browser_download_url") or ""
     if not url:
-        try:
-            url = client.download_url(entry.project_id, int(f["id"]))
-        except CurseForgeError:
-            url = ""
-    if not url:
-        raise ManualDownload("The author does not allow downloads outside the CurseForge app. "
-                             "Use the addon's CurseForge page to download it manually.")
+        raise UpdateError("The release file has no download address.")
     addons_path = cfg["addons_path"]
     fd, tmp = tempfile.mkstemp(prefix="wau_", suffix=".zip")
     os.close(fd)
     try:
         client.download(url, tmp, progress)
-        size = int(f.get("fileLength") or 0)
+        size = int(asset.get("size") or 0)
         if size and os.path.getsize(tmp) != size:
             raise UpdateError("The download is incomplete (size mismatch). Try again.")
-        sha1 = next((h.get("value") for h in (f.get("hashes") or []) if h.get("algo") == 1), None)
-        if sha1:
-            digest = hashlib.sha1()
+        digest = str(asset.get("digest") or "")
+        if digest.lower().startswith("sha256:"):
+            sha = hashlib.sha256()
             with open(tmp, "rb") as fh:
                 for block in iter(lambda: fh.read(1 << 20), b""):
-                    digest.update(block)
-            if digest.hexdigest().lower() != sha1.lower():
+                    sha.update(block)
+            if sha.hexdigest().lower() != digest.split(":", 1)[1].strip().lower():
                 raise UpdateError("The download failed its checksum. Try again.")
-        folders = install_zip(tmp, addons_path, backup=bool(cfg["backup"]))
+        folders = install_zip(tmp, addons_path, backup=bool(cfg["backup"]), expect=set(entry.folders))
     finally:
         try:
             os.remove(tmp)
         except OSError:
             pass
 
-    # Re-read the installed version from the new files and remember the exact file id.
+    # Re-read the installed version from the new files and remember the exact release file.
     fresh = {a.folder: a for a in scan_addons(addons_path) if a.folder in folders}
     new_version = fresh[entry.primary].version if entry.primary in fresh else ""
     if not new_version:
@@ -796,9 +833,12 @@ def update_entry(entry: Entry, cfg: Config, client: CurseForge, progress=None) -
     entry.installed = new_version or entry.installed
     entry.folders = sorted(set(entry.folders) | set(folders), key=str.lower)
     profile = cfg.profile()
-    profile["installed"][str(entry.project_id)] = {
-        "file_id": int(f["id"]),
-        "file_name": f.get("fileName", ""),
+    profile["installed"][entry.repo.lower()] = {
+        "repo": entry.repo,
+        "tag": release.get("tag_name", ""),
+        "asset_id": asset.get("id"),
+        "asset": asset.get("name", ""),
+        "published_at": release.get("published_at") or "",
         "toc_version": entry.installed,
         "folders": folders,
         "date": _dt.datetime.now().isoformat(timespec="seconds"),
@@ -822,8 +862,8 @@ def run_gui(selftest: bool = False) -> None:
 
     COLORS = {
         ST_OK: "#2e7d32", ST_UPDATED: "#2e7d32", ST_UPDATE: "#c75300", ST_DIFF: "#c75300",
-        ST_ERROR: "#c62828", ST_MISSING: "#c62828", ST_MANUAL: "#c75300", ST_UNLINKED: "#777777",
-        ST_NOFILE: "#777777", ST_NEWER: "#1565c0", ST_QUEUED: "#555555", ST_UPDATING: "#1565c0",
+        ST_ERROR: "#c62828", ST_MISSING: "#c62828", ST_UNLINKED: "#777777",
+        ST_NOFILE: "#777777", ST_NOREL: "#777777", ST_NEWER: "#1565c0", ST_QUEUED: "#555555", ST_UPDATING: "#1565c0",
     }
     ROW_BG = ("#ffffff", "#f4f6f8")
     HEAD_BG = "#e3e7eb"
@@ -858,8 +898,6 @@ def run_gui(selftest: bool = False) -> None:
             self.cfg = Config()
             self.entries: list = []
             self.rows: dict = {}
-            self.flavors = list(FALLBACK_FLAVORS)
-            self.flavors_loaded = False
             self.jobs: queue.Queue = queue.Queue()
             self.events: queue.Queue = queue.Queue()
             self.pending = 0
@@ -948,63 +986,54 @@ def run_gui(selftest: bool = False) -> None:
 
         # -- flavour selection --------------------------------------------
         def refresh_flavors(self):
-            names = ["Auto-detect from folder"] + ["%s  (%d)" % (name, fid) for fid, name in self.flavors]
-            self.flavor_box["values"] = names
-            current = int(self.cfg["flavor_id"] or 0)
-            index = 0
-            for i, (fid, _name) in enumerate(self.flavors, 1):
-                if fid == current:
-                    index = i
-            self.flavor_box.current(index)
+            self.flavor_box["values"] = ["Auto-detect from folder"] + [label for _k, label, _m, _w in FLAVORS]
+            keys = [f[0] for f in FLAVORS]
+            current = self.cfg["flavor"]
+            self.flavor_box.current(keys.index(current) + 1 if current in keys else 0)
 
         def on_flavor(self, _e=None):
             i = self.flavor_box.current()
-            self.cfg["flavor_id"] = 0 if i <= 0 else self.flavors[i - 1][0]
+            self.cfg["flavor"] = "" if i <= 0 else FLAVORS[i - 1][0]
             self.cfg.save()
-
-        def flavor_name(self, fid):
-            return next((name for f, name in self.flavors if f == fid), "game version %d" % fid)
 
         # -- first run / settings -----------------------------------------
         def first_run(self):
-            if not self.cfg["api_key"]:
-                self.settings(first=True)
-            if self.cfg["api_key"] and os.path.isdir(self.cfg["addons_path"]):
+            if os.path.isdir(self.cfg["addons_path"]):
                 self.start_check()
 
-        def settings(self, first=False):
+        def settings(self):
             win = tk.Toplevel(self.root)
             win.title("Settings")
             win.transient(self.root)
             win.resizable(False, False)
             frm = ttk.Frame(win, padding=14)
             frm.pack(fill="both", expand=True)
-            intro = ("CurseForge only allows version checks and downloads through its official API, "
-                     "which needs an API key. Apply for one with the form linked below, then paste it here. "
-                     "It is stored in %s next to this program." % CONFIG_NAME)
+            intro = ("No account is needed. Without a token GitHub allows 60 requests per hour from your "
+                     "connection, and each check uses one request per addon. A personal access token with "
+                     "no extra permissions raises this to 5,000. It is stored in %s next to this "
+                     "program." % CONFIG_NAME)
             ttk.Label(frm, text=intro, wraplength=460, justify="left").grid(row=0, column=0, columnspan=3, sticky="w")
-            link = tk.Label(frm, text=API_KEY_URL, fg="#1565c0", cursor="hand2")
+            link = tk.Label(frm, text=TOKEN_URL, fg="#1565c0", cursor="hand2")
             link.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 10))
-            link.bind("<Button-1>", lambda e: webbrowser.open(API_KEY_URL))
-            ttk.Label(frm, text="API key:").grid(row=2, column=0, sticky="w")
-            key_var = tk.StringVar(value=self.cfg["api_key"])
-            key_entry = ttk.Entry(frm, textvariable=key_var, width=52, show="•")
+            link.bind("<Button-1>", lambda e: webbrowser.open(TOKEN_URL))
+            ttk.Label(frm, text="Token (optional):").grid(row=2, column=0, sticky="w")
+            key_var = tk.StringVar(value=self.cfg["token"])
+            key_entry = ttk.Entry(frm, textvariable=key_var, width=48, show="•")
             key_entry.grid(row=2, column=1, sticky="ew", padx=6)
             show_var = tk.BooleanVar(value=False)
             ttk.Checkbutton(frm, text="Show", variable=show_var,
                             command=lambda: key_entry.configure(show="" if show_var.get() else "•")
                             ).grid(row=2, column=2)
-            ttk.Label(frm, text="Releases:").grid(row=3, column=0, sticky="w", pady=(10, 0))
-            chan_box = ttk.Combobox(frm, state="readonly", width=26, values=list(CHANNEL_LABELS.values()))
-            chan_box.current(max(0, min(2, int(self.cfg["channel"]) - 1)))
-            chan_box.grid(row=3, column=1, sticky="w", padx=6, pady=(10, 0))
+            pre_var = tk.BooleanVar(value=bool(self.cfg["prerelease"]))
+            ttk.Checkbutton(frm, text="Include pre-releases (alpha, beta and development builds)",
+                            variable=pre_var).grid(row=3, column=0, columnspan=3, sticky="w", pady=(10, 0))
             backup_var = tk.BooleanVar(value=bool(self.cfg["backup"]))
             ttk.Checkbutton(frm, text="Keep the previous version of each addon in Interface\\AddOns_Backup",
-                            variable=backup_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+                            variable=backup_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
 
             def save():
-                self.cfg["api_key"] = key_var.get().strip()
-                self.cfg["channel"] = chan_box.current() + 1
+                self.cfg["token"] = key_var.get().strip()
+                self.cfg["prerelease"] = bool(pre_var.get())
                 self.cfg["backup"] = bool(backup_var.get())
                 self.cfg.save()
                 win.destroy()
@@ -1013,7 +1042,6 @@ def run_gui(selftest: bool = False) -> None:
             btns.grid(row=5, column=0, columnspan=3, sticky="e", pady=(14, 0))
             ttk.Button(btns, text="Save", command=save).pack(side="right")
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=6)
-            key_entry.focus_set()
             win.bind("<Return>", lambda e: save())
             win.bind("<Escape>", lambda e: win.destroy())
             win.grab_set()
@@ -1054,9 +1082,6 @@ def run_gui(selftest: bool = False) -> None:
                         self.render()
                     elif kind == "row":
                         self.refresh_row(ev[1])
-                    elif kind == "flavors":
-                        self.flavors, self.flavors_loaded = ev[1], True
-                        self.refresh_flavors()
                     elif kind == "check_done":
                         self.checking = False
                         self.check_btn.configure(state="normal")
@@ -1074,7 +1099,7 @@ def run_gui(selftest: bool = False) -> None:
             self.root.after(80, self.pump)
 
         def client(self):
-            return CurseForge(self.cfg["api_key"], self.cfg["api_base"])
+            return GitHub(self.cfg["token"], self.cfg["api_base"])
 
         def start_check(self):
             if self.checking:
@@ -1086,57 +1111,41 @@ def run_gui(selftest: bool = False) -> None:
             self.cfg["addons_path"] = path
             self.cfg["only_updates"] = bool(self.only_var.get())
             self.cfg.save()
-            if not self.cfg["api_key"]:
-                self.settings(first=True)
-                if not self.cfg["api_key"]:
-                    self.submit(self.job_scan_only)
-                    return
             self.checking = True
             self.check_btn.configure(state="disabled")
             self.submit(self.job_check)
 
-        def job_scan_only(self):
-            addons = scan_addons(self.cfg["addons_path"])
-            entries = build_entries(addons, self.cfg.profile(), None)
-            self.events.put(("entries", entries))
-            self.events.put(("status", "%d addons found. Add a CurseForge API key under Settings "
-                                       "to check for updates." % len(entries)))
-
         def job_check(self):
             say = lambda text: self.events.put(("status", text))
+            entries = []
             try:
                 say("Scanning %s…" % self.cfg["addons_path"])
                 addons = scan_addons(self.cfg["addons_path"])
                 profile = self.cfg.profile()
-                client = self.client()
-                if not self.flavors_loaded:
-                    try:
-                        live = client.version_types()
-                        if live:
-                            self.flavors = sorted(live, key=lambda t: t[1].lower())
-                            self.events.put(("flavors", self.flavors))
-                    except CurseForgeError as exc:
-                        if "API key" in str(exc):
-                            raise
-                flavor_id = int(self.cfg["flavor_id"] or 0) or detect_flavor(self.cfg["addons_path"], self.flavors)
-                if not flavor_id:
-                    self.events.put(("entries", build_entries(addons, profile, None)))
+                entries = build_entries(addons, profile)
+                flavor = self.cfg["flavor"] or detect_flavor(self.cfg["addons_path"])
+                if not flavor:
+                    self.events.put(("entries", entries))
                     self.events.put(("error", "Could not tell which game version this folder belongs to.\n\n"
                                               "Pick it in the 'Game version' list and check again."))
                     say("Pick a game version, then check again.")
                     return
-                entries = build_entries(addons, profile, client, progress=say)
-                check_entries(entries, profile, client, flavor_id, int(self.cfg["channel"]), progress=say)
-                self.cfg.save()
-                self.events.put(("entries", entries))
+                client = self.client()
+                try:
+                    check_entries(entries, profile, client, flavor, bool(self.cfg["prerelease"]), progress=say)
+                finally:
+                    self.events.put(("entries", entries))
                 updates = sum(1 for e in entries if e.status in (ST_UPDATE, ST_DIFF))
                 unlinked = sum(1 for e in entries if e.status == ST_UNLINKED)
-                text = "%d addons checked against %s — %d with updates" % (
-                    len(entries), self.flavor_name(flavor_id), updates)
+                text = "%d addons checked for %s — %d with updates" % (
+                    len(entries), flavor_label(flavor), updates)
                 if unlinked:
-                    text += ", %d not linked to CurseForge" % unlinked
-                say(text + ".")
-            except CurseForgeError as exc:
+                    text += ", %d not linked to a GitHub repository" % unlinked
+                text += "."
+                if client.remaining is not None and not self.cfg["token"]:
+                    text += "  GitHub requests left this hour: %d." % client.remaining
+                say(text)
+            except GitHubError as exc:
                 say(str(exc))
                 self.events.put(("error", str(exc)))
             except OSError as exc:
@@ -1146,8 +1155,7 @@ def run_gui(selftest: bool = False) -> None:
 
         # -- table ---------------------------------------------------------
         def visible(self):
-            order = {ST_UPDATE: 0, ST_DIFF: 0, ST_QUEUED: 0, ST_UPDATING: 0, ST_ERROR: 0, ST_MANUAL: 0,
-                     ST_UPDATED: 1}
+            order = {ST_UPDATE: 0, ST_DIFF: 0, ST_QUEUED: 0, ST_UPDATING: 0, ST_ERROR: 0, ST_UPDATED: 1}
             items = sorted(self.entries, key=lambda e: (order.get(e.status, 2), e.name.lower()))
             if self.only_var.get():
                 items = [e for e in items if order.get(e.status, 2) < 2]
@@ -1177,9 +1185,9 @@ def run_gui(selftest: bool = False) -> None:
                 name.bind("<Button-3>", lambda ev, e=e: self.menu(ev, e))
                 name.bind("<Double-Button-1>", lambda ev, e=e: e.url and webbrowser.open(e.url))
                 Tooltip(name, lambda e=e: "Folders: " + ", ".join(e.folders) +
-                        ("\nCurseForge project %s (matched by %s) — double-click to open the page, "
-                         "right-click for options" % (e.project_id, e.matched_by) if e.project_id else
-                         "\nRight-click for options"))
+                        ("\nGitHub: %s (matched by %s) — double-click to open the release page, "
+                         "right-click for options" % (e.repo, e.matched_by) if e.repo else
+                         "\nNot linked to a GitHub repository — use Link…, or right-click for options"))
                 Tooltip(cells[1], lambda e=e: e.installed)
                 Tooltip(cells[2], lambda e=e: e.available)
                 Tooltip(cells[3], lambda e=e: e.detail)
@@ -1204,7 +1212,7 @@ def run_gui(selftest: bool = False) -> None:
                                cursor="hand2" if e.detail else "")
             if e.status == ST_UNLINKED:
                 btn.configure(text="Link…", state="normal", command=lambda: self.link(e))
-            elif e.status == ST_MANUAL and e.url:
+            elif e.status == ST_NOFILE and e.url:
                 btn.configure(text="Open page", state="normal", command=lambda: webbrowser.open(e.url))
             elif e.can_update:
                 btn.configure(text="Retry" if e.status == ST_ERROR else "Update", state="normal",
@@ -1223,11 +1231,11 @@ def run_gui(selftest: bool = False) -> None:
         def menu(self, event, e):
             m = tk.Menu(self.root, tearoff=0)
             if e.url:
-                m.add_command(label="Open CurseForge page", command=lambda: webbrowser.open(e.url))
+                m.add_command(label="Open GitHub release page", command=lambda: webbrowser.open(e.url))
             m.add_command(label="Open addon folder", command=lambda: self.open_folder(e))
-            m.add_command(label="Link to a CurseForge project…", command=lambda: self.link(e))
-            if e.project_id:
-                m.add_command(label="Remove CurseForge link", command=lambda: self.unlink(e))
+            m.add_command(label="Link to a GitHub repository…", command=lambda: self.link(e))
+            if e.repo:
+                m.add_command(label="Remove GitHub link", command=lambda: self.unlink(e))
             m.tk_popup(event.x_root, event.y_root)
 
         def open_folder(self, e):
@@ -1240,42 +1248,42 @@ def run_gui(selftest: bool = False) -> None:
         # -- linking -------------------------------------------------------
         def link(self, e):
             text = simpledialog.askstring(
-                "Link to CurseForge",
-                "Paste the CurseForge page address or project ID for\n“%s”:\n\n"
-                "Example: https://www.curseforge.com/wow/addons/tomtom" % e.name, parent=self.root)
+                "Link to GitHub",
+                "Paste the GitHub repository address for\n“%s”:\n\n"
+                "Example: https://github.com/Questie/Questie" % e.name,
+                initialvalue=("https://github.com/" + e.repo) if e.repo else "", parent=self.root)
             if not text:
                 return
-            kind, value = parse_link(text)
-            if not kind:
-                messagebox.showerror(APP_NAME, "That does not look like a CurseForge addon address or ID.",
+            repo = parse_repo(text)
+            if not repo:
+                messagebox.showerror(APP_NAME, "That does not look like a GitHub repository address.\n\n"
+                                               "Expected something like https://github.com/owner/name",
                                      parent=self.root)
                 return
             folders = list(e.folders)
 
             def job():
                 try:
-                    pid = value
-                    if kind == "slug":
-                        mod = self.client().search_slug(value)
-                        if not mod:
-                            self.events.put(("error", "CurseForge has no WoW addon at “%s”." % value))
-                            return
-                        pid = int(mod["id"])
-                    links = self.cfg.profile()["links"]
-                    for folder in folders:
-                        links[folder] = pid
-                    self.cfg.save()
-                    self.events.put(("status", "Linked. Checking again…"))
-                    self.job_check()
-                except CurseForgeError as exc:
+                    self.client().releases(repo)      # confirms the repository exists and is public
+                except RepoNotFound:
+                    self.events.put(("error", "GitHub has no public repository at “%s”." % repo))
+                    return
+                except GitHubError as exc:
                     self.events.put(("error", str(exc)))
+                    return
+                links = self.cfg.profile()["links"]
+                for folder in folders:
+                    links[folder] = repo
+                self.cfg.save()
+                self.events.put(("status", "Linked to %s. Checking again…" % repo))
+                self.job_check()
             self.submit(job)
 
         def unlink(self, e):
             prof = self.cfg.profile()
             for folder in e.folders:
-                prof["links"][folder] = 0     # 0 = deliberately not linked
-            prof["installed"].pop(str(e.project_id), None)
+                prof["links"][folder] = ""    # empty = deliberately not linked
+            prof["installed"].pop(e.repo.lower(), None)
             self.cfg.save()
             self.start_check()
 
@@ -1295,10 +1303,7 @@ def run_gui(selftest: bool = False) -> None:
                     e.status, e.detail = ST_UPDATED, ""
                     self.events.put(("status", "%s updated to %s. Type /reload in game if WoW is running."
                                      % (e.name, e.available)))
-                except ManualDownload as exc:
-                    e.status, e.detail = ST_MANUAL, str(exc)
-                    self.events.put(("status", "%s: %s" % (e.name, exc)))
-                except (UpdateError, CurseForgeError) as exc:
+                except (UpdateError, GitHubError) as exc:
                     e.status, e.detail = ST_ERROR, str(exc)
                     self.events.put(("status", "%s: %s" % (e.name, exc)))
                 except OSError as exc:

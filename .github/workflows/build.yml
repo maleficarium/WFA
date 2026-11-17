@@ -13,15 +13,20 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pyinstaller
-      - run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoWAddonUpdater addon_updater.py
+      - run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name WoWAddonUpdater-GitHub addon_updater.py
       - name: Smoke test (start the exe once on Windows)
         shell: pwsh
         timeout-minutes: 3
         run: |
-          $p = Start-Process -FilePath dist\WoWAddonUpdater.exe -ArgumentList '--selftest' -Wait -PassThru
+          $p = Start-Process -FilePath dist\WoWAddonUpdater-GitHub.exe -ArgumentList '--selftest' -Wait -PassThru
           Write-Host "exit code $($p.ExitCode)"
           if ($p.ExitCode -ne 0) { exit 1 }
+      - name: Live check against GitHub (informational, never fails the build)
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tools/live_check.py --search "NeedRoll in:name" --search "PRR in:name language:Lua"
       - uses: actions/upload-artifact@v4
         with:
-          name: WoWAddonUpdater
-          path: dist/WoWAddonUpdater.exe
+          name: WoWAddonUpdater-GitHub
+          path: dist/WoWAddonUpdater-GitHub.exe

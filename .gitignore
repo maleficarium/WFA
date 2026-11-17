@@ -1,5 +1,5 @@
-WoWAddonUpdater.json
-WoWAddonUpdater.json.tmp
+WoWAddonUpdater*.json
+WoWAddonUpdater*.json.tmp
 __pycache__/
 *.pyc
 build/
