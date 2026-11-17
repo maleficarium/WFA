@@ -62,7 +62,6 @@ INTERFACE_RANGES = {"forever": (16000, 16999)}
 KNOWN_REPOS = {
     "questie": "Questie/Questie",
     "questiedb": "Questie/QuestieDB",
-    "tomtom": "jnwhiteh/TomTom",
     "openmap": "openmap-world/openmap",
 }
 
@@ -294,12 +293,16 @@ def _numeric(text: str) -> tuple | None:
     groups = re.findall(r"\d+(?:\.\d+)*", text or "")
     if not groups:
         return None
-    best = max(reversed(groups), key=lambda g: g.count("."))
+    best = max(groups, key=lambda g: g.count("."))   # the first of the most detailed groups
     return tuple(int(p) for p in best.split("."))
 
 
-def compare_versions(installed: str, latest_name: str, latest_file: str = "") -> str:
-    """Return 'same', 'older', 'newer' or 'unknown' for the installed version."""
+def compare_versions(installed: str, latest_name: str, latest_file: str = "", addon: str = "") -> str:
+    """Return 'same', 'older', 'newer' or 'unknown' for the installed version.
+
+    `addon` is the addon's folder name; it is ignored inside the release name so that digits
+    in the name itself (Ace3, Bartender4) are not read as a version.
+    """
     inst = _norm(installed)
     if not inst:
         return "unknown"
@@ -308,7 +311,8 @@ def compare_versions(installed: str, latest_name: str, latest_file: str = "") ->
     for candidate in (_norm(latest_name), _norm(latest_file)):
         if candidate and (candidate == inst or pattern.search(candidate)):
             return "same"
-    a, b = _numeric(inst), _numeric(_norm(latest_name)) or _numeric(_norm(latest_file))
+    bare = lambda text: _norm(text).replace(_norm(addon), "") if addon else _norm(text)
+    a, b = _numeric(inst), _numeric(bare(latest_name)) or _numeric(bare(latest_file))
     if a and b and len(a) == len(b):
         return "same" if a == b else ("older" if a < b else "newer")
     return "unknown"
@@ -644,9 +648,9 @@ def evaluate(entry: Entry, profile: dict) -> None:
         else:
             entry.status = ST_NEWER
         return
-    result = compare_versions(entry.installed, release.get("tag_name", ""), asset.get("name", ""))
+    result = compare_versions(entry.installed, release.get("tag_name", ""), asset.get("name", ""), entry.primary)
     if result == "unknown" and release.get("name"):
-        result = compare_versions(entry.installed, release["name"])
+        result = compare_versions(entry.installed, release["name"], addon=entry.primary)
     entry.status = {"same": ST_OK, "older": ST_UPDATE, "newer": ST_NEWER}.get(result, ST_DIFF)
     if entry.status == ST_DIFF:
         entry.detail = ("The installed version text does not match the latest release, so it may be "
@@ -728,8 +732,12 @@ def _rmtree(path: str) -> None:
         shutil.rmtree(path, onerror=onerror)
 
 
-def install_zip(zip_path: str, addons_path: str, backup: bool = True, expect: set | None = None) -> list:
-    """Replace the addon folders contained in zip_path. Returns the folder names installed.
+def install_zip(zip_path: str, addons_path: str, backup: bool = True,
+                expect: set | None = None, skip: set | None = None) -> tuple:
+    """Replace the addon folders contained in zip_path. Returns (installed, skipped) folder names.
+
+    `expect`: the zip must contain at least one of these folders, or nothing is installed.
+    `skip`: folders to leave untouched even if the zip contains them.
 
     The old folders are moved aside first and put back if anything fails, so an
     interrupted update never leaves a half-written addon behind.
@@ -744,12 +752,19 @@ def install_zip(zip_path: str, addons_path: str, backup: bool = True, expect: se
             if expect and not ({t.lower() for t in tops} & {f.lower() for f in expect}):
                 raise UpdateError("The release file does not contain this addon (it holds: %s). "
                                   "Check the repository link." % ", ".join(tops))
+            leave = {f.lower() for f in (skip or ())}
+            skipped = [t for t in tops if t.lower() in leave]
+            tops = [t for t in tops if t.lower() not in leave]
+            if not tops:
+                raise UpdateError("Nothing to install: every folder in the release file belongs to another row.")
             os.makedirs(staging)
             root = os.path.realpath(staging)
             for info in zf.infolist():
                 parts = [p for p in info.filename.replace("\\", "/").split("/") if p]
                 if len(parts) < 2 and not info.is_dir():
                     continue  # loose file at the archive root: not part of an addon
+                if parts and parts[0] in skipped:
+                    continue
                 target = os.path.realpath(os.path.join(staging, *parts))
                 if target != root and not target.startswith(root + os.sep):
                     raise UpdateError("The downloaded archive contains an unsafe path.")
@@ -791,11 +806,15 @@ def install_zip(zip_path: str, addons_path: str, backup: bool = True, expect: se
         raise UpdateError("Could not replace the addon files (%s). Close World of Warcraft "
                           "and try again." % (getattr(exc, "strerror", None) or exc)) from None
     _rmtree(staging)
-    return tops
+    return tops, skipped
 
 
-def update_entry(entry: Entry, cfg: Config, client: GitHub, progress=None) -> None:
-    """Download and install the release file in entry.latest, then record what was installed."""
+def update_entry(entry: Entry, cfg: Config, client: GitHub, progress=None, skip: set | None = None) -> list:
+    """Download and install the release file in entry.latest, then record what was installed.
+
+    `skip` names folders that belong to other entries (a bundle zip may carry a second addon
+    that is tracked from its own repository); they are left untouched. Returns those skipped.
+    """
     if not entry.latest:
         raise UpdateError("Nothing to install.")
     release, asset = entry.latest["release"], entry.latest["asset"]
@@ -818,7 +837,8 @@ def update_entry(entry: Entry, cfg: Config, client: GitHub, progress=None) -> No
                     sha.update(block)
             if sha.hexdigest().lower() != digest.split(":", 1)[1].strip().lower():
                 raise UpdateError("The download failed its checksum. Try again.")
-        folders = install_zip(tmp, addons_path, backup=bool(cfg["backup"]), expect=set(entry.folders))
+        folders, skipped = install_zip(tmp, addons_path, backup=bool(cfg["backup"]),
+                                       expect=set(entry.folders), skip=skip)
     finally:
         try:
             os.remove(tmp)
@@ -844,6 +864,7 @@ def update_entry(entry: Entry, cfg: Config, client: GitHub, progress=None) -> No
         "date": _dt.datetime.now().isoformat(timespec="seconds"),
     }
     cfg.save()
+    return skipped
 
 
 # --------------------------------------------------------------------------
@@ -1293,16 +1314,23 @@ def run_gui(selftest: bool = False) -> None:
                 return
             e.status, e.detail = ST_QUEUED, ""
             self.refresh_row(e.key)
+            # folders tracked by another entry from a different repository are not overwritten
+            skip = {f for o in self.entries if o is not e and o.repo and o.repo.lower() != e.repo.lower()
+                    for f in o.folders}
 
             def job():
                 e.status = ST_UPDATING
                 self.events.put(("row", e.key))
                 self.events.put(("status", "Updating %s…" % e.name))
                 try:
-                    update_entry(e, self.cfg, self.client())
+                    skipped = update_entry(e, self.cfg, self.client(), skip=skip)
                     e.status, e.detail = ST_UPDATED, ""
-                    self.events.put(("status", "%s updated to %s. Type /reload in game if WoW is running."
-                                     % (e.name, e.available)))
+                    note = ""
+                    if skipped:
+                        note = " %s also in this download was left alone: it has its own row." % ", ".join(skipped)
+                        e.detail = note.strip()
+                    self.events.put(("status", "%s updated to %s.%s Type /reload in game if WoW is running."
+                                     % (e.name, e.available, note)))
                 except (UpdateError, GitHubError) as exc:
                     e.status, e.detail = ST_ERROR, str(exc)
                     self.events.put(("status", "%s: %s" % (e.name, exc)))

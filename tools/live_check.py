@@ -47,6 +47,8 @@ def main() -> None:
                                                    ", digest" if asset.get("digest") else ""))
                 if (asset.get("name") or "").lower() == "release.json" and rel is releases[0]:
                     print("        manifest: %s" % str(client.manifest(asset.get("browser_download_url") or ""))[:900])
+        if len(releases) > 4:
+            print("   older tags: %s" % ", ".join(str(r.get("tag_name")) for r in releases[4:]))
         found = au.pick_release(releases, flavor, folder, False, client)
         if found:
             print("   PICK for %s: %s -> %s (chosen by %s)" % (flavor, found[0].get("tag_name"), found[1].get("name"), found[2]))

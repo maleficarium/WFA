@@ -25,7 +25,7 @@ jobs:
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python tools/live_check.py --search "NeedRoll in:name" --search "PRR in:name language:Lua"
+        run: python tools/live_check.py --search "TomTom in:name language:Lua" --search "user:jnwhiteh" --search "PRR in:name wow"
       - uses: actions/upload-artifact@v4
         with:
           name: WoWAddonUpdater-GitHub

@@ -22,7 +22,8 @@ from your connection, and one check uses one request per addon. An optional pers
 - **Installed version**: the `## Version:` line of each addon's `.toc` file.
 - **Finding the repository**, in this order: a link you set by hand (**Link…** accepts an address
   such as `https://github.com/Questie/Questie`); a GitHub address in the addon's `.toc`
-  (`X-Website`, `X-Github`, …); a small built-in list (`KNOWN_REPOS` in `addon_updater.py`).
+  (`X-Website`, `X-Github`, …); a small built-in list (`KNOWN_REPOS` in `addon_updater.py`,
+  currently Questie, QuestieDB and OpenMap).
   Nothing is guessed by searching GitHub, so the tool never installs from a look-alike repository.
 - **Choosing the file**: the newest published release that has a zip for your game version.
   `_forever_` is detected from the folder path; others can be picked in the *Game version* list.
@@ -33,6 +34,8 @@ from your connection, and one check uses one request per addon. An optional pers
   it contains the addon's folder, unpacks it beside the AddOns folder, then swaps the folders in.
   The previous version is kept in `Interface\AddOns_Backup` (one copy per addon; can be switched
   off). If anything fails the old folders are put back.
+- **Bundles**: if a release zip also carries an addon that has its own row (Questie's zip includes
+  QuestieDB), that folder is left alone and is updated from its own repository instead.
 - After an addon has been updated through the tool, later checks compare the exact release file.
   Before that, comparison is by version text; where the two cannot be compared the row says
   **Different version** rather than guessing.
